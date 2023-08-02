@@ -43,6 +43,18 @@ def get_parser():
     )
     parser.add_argument("--namespace", help="Namespace")
     parser.add_argument(
+        "--auto-downscale",
+        default=os.getenv("AUTO_DOWNSCALE", "false"),
+        action="store_true",
+        help=f"Enable automatic continuous downscaling",
+    )
+    parser.add_argument(
+        "--auto-downscale-period-seconds",
+        default=os.getenv("AUTO_DOWNSCALE_PERIOD_SECONDS", 10800),
+        type=int,
+        help=f"Automatic continuous downscaling period (default: 3 hours)",
+    )
+    parser.add_argument(
         "--include-resources",
         type=check_include_resources,
         default=os.getenv("INCLUDE_RESOURCES", "deployments"),

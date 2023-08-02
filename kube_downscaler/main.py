@@ -27,6 +27,8 @@ def main(args=None):
         logger.info("**DRY-RUN**: no downscaling will be performed!")
 
     return run_loop(
+        args.auto_downscale,
+        args.auto_downscale_period_seconds,
         args.once,
         args.namespace,
         args.include_resources,
@@ -47,6 +49,8 @@ def main(args=None):
 
 
 def run_loop(
+    auto_downscale,
+    auto_downscale_period_seconds,
     run_once,
     namespace,
     include_resources,
@@ -86,6 +90,8 @@ def run_loop(
                 matching_labels=frozenset(
                     re.compile(pattern) for pattern in matching_labels.split(",")
                 ),
+                auto_downscale=auto_downscale,
+                auto_downscale_period_seconds=auto_downscale_period_seconds,
             )
         except Exception as e:
             logger.exception(f"Failed to autoscale: {e}")

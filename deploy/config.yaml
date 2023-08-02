@@ -5,3 +5,5 @@ metadata:
 data:
   # downscale for non-work hours
   DEFAULT_UPTIME: "Mon-Fri 07:30-20:30 CET"
+  AUTO_DOWNSCALE: true
+  AUTO_DOWNSCALE_PERIOD_SECONDS: 10800 # 3 hours

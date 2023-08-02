@@ -29,6 +29,7 @@ EXCLUDE_UNTIL_ANNOTATION = "downscaler/exclude-until"
 UPTIME_ANNOTATION = "downscaler/uptime"
 DOWNTIME_ANNOTATION = "downscaler/downtime"
 DOWNTIME_REPLICAS_ANNOTATION = "downscaler/downtime-replicas"
+AUTODOWNSCALE_SNOOZED_AT = "downscaler/auto-downscale-snoozed-at"
 
 RESOURCE_CLASSES = [
     Deployment,
@@ -303,6 +304,9 @@ def autoscale_resource(
     deployment_time_annotation: Optional[str] = None,
     enable_events: bool = False,
     matching_labels: FrozenSet[Pattern] = frozenset(),
+    auto_downscale: bool = False,
+    auto_downscale_snoozed_at: datetime.datetime = None,
+    auto_downscale_period_seconds: int = 0,
 ):
     try:
         exclude = (
@@ -341,6 +345,17 @@ def autoscale_resource(
                 uptime = "ignored"
                 downtime = "forced"
                 is_uptime = False
+            elif auto_downscale:
+                uptime = "ignored"
+                downtime = "ignored"
+                logger.debug(
+                    f"Auto downscaling is enabled {resource.namespace} has snoozed at set to {auto_downscale_snoozed_at}"
+                )
+                if auto_downscale_snoozed_at is None or auto_downscale_snoozed_at + datetime.timedelta(seconds=auto_downscale_period_seconds) < now:
+                    is_uptime = False
+                    logger.debug(
+                        f"setting uptime to false as auto downscale is enabled and snooze period has passed"
+                    )
             elif upscale_period != "never" or downscale_period != "never":
                 uptime = upscale_period
                 downtime = downscale_period
@@ -430,6 +445,8 @@ def autoscale_resources(
     exclude_namespaces: FrozenSet[Pattern],
     exclude_names: FrozenSet[str],
     matching_labels: FrozenSet[Pattern],
+    auto_downscale: bool,
+    auto_downscale_period_seconds: int,
     upscale_period: str,
     downscale_period: str,
     default_uptime: str,
@@ -469,6 +486,8 @@ def autoscale_resources(
         namespace_obj = Namespace.objects(api).get_by_name(current_namespace)
 
         excluded = ignore_resource(namespace_obj, now)
+
+        auto_downscale_snoozed_at = get_and_adjust_auto_downscale_snoozed_at(namespace_obj, now)
 
         default_uptime_for_namespace = namespace_obj.annotations.get(
             UPTIME_ANNOTATION, default_uptime
@@ -533,7 +552,33 @@ def autoscale_resources(
                 deployment_time_annotation=deployment_time_annotation,
                 enable_events=enable_events,
                 matching_labels=matching_labels,
+                auto_downscale=auto_downscale,
+                auto_downscale_snoozed_at=auto_downscale_snoozed_at,
+                auto_downscale_period_seconds=auto_downscale_period_seconds,
             )
+
+
+def get_and_adjust_auto_downscale_snoozed_at(namespace_obj, now: datetime):
+    auto_downscale_snoozed_at_str = namespace_obj.annotations.get(
+        AUTODOWNSCALE_SNOOZED_AT, None
+    )
+    if auto_downscale_snoozed_at_str is None:
+        return None
+    try:
+        auto_downscale_snoozed_at = datetime.datetime.fromisoformat(auto_downscale_snoozed_at_str)
+        if auto_downscale_snoozed_at > now:
+            logger.debug(f"AUTODOWNSCALE_SNOOZED_AT for {namespace_obj} is set to {auto_downscale_snoozed_at_str} which is in the future, resetting to now")
+            namespace_obj.annotations[AUTODOWNSCALE_SNOOZED_AT] = now.isoformat()
+            namespace_obj.update()
+            auto_downscale_snoozed_at = now
+    except (TypeError, ValueError) as e:
+        logger.debug(
+            f"Can't convert AUTODOWNSCALE_SNOOZED_AT from {auto_downscale_snoozed_at_str} to date, gonna use "
+            f"current date and reset AUTODOWNSCALE_SNOOZED_AT to current date {now} ")
+        namespace_obj.annotations[AUTODOWNSCALE_SNOOZED_AT] = now.isoformat()
+        namespace_obj.update()
+        auto_downscale_snoozed_at = now
+    return auto_downscale_snoozed_at
 
 
 def scale(
@@ -551,10 +596,12 @@ def scale(
     deployment_time_annotation: Optional[str] = None,
     enable_events: bool = False,
     matching_labels: FrozenSet[Pattern] = frozenset(),
+    auto_downscale: bool = False,
+    auto_downscale_period_seconds: int = 0,
 ):
     api = helper.get_kube_api()
 
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=datetime.timezone.utc)
     forced_uptime = pods_force_uptime(api, namespace)
 
     for clazz in RESOURCE_CLASSES:
@@ -567,6 +614,8 @@ def scale(
                 exclude_namespaces,
                 exclude_deployments,
                 matching_labels,
+                auto_downscale,
+                auto_downscale_period_seconds,
                 upscale_period,
                 downscale_period,
                 default_uptime,

@@ -1,16 +1,18 @@
 import json
 import logging
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from unittest.mock import MagicMock
 
 import pykube
 import pytest
-from pykube import Deployment
+from pykube import Deployment, Namespace
 from pykube import HorizontalPodAutoscaler
 
 from kube_downscaler.resources.stack import Stack
-from kube_downscaler.scaler import autoscale_resource
+from kube_downscaler.scaler import autoscale_resource, AUTODOWNSCALE_SNOOZED_AT, autoscale_resources
+from kube_downscaler.scaler import get_and_adjust_auto_downscale_snoozed_at
 from kube_downscaler.scaler import DOWNSCALE_PERIOD_ANNOTATION
 from kube_downscaler.scaler import DOWNTIME_REPLICAS_ANNOTATION
 from kube_downscaler.scaler import EXCLUDE_ANNOTATION
@@ -25,6 +27,13 @@ def resource():
     res.kind = "MockResource"
     res.namespace = "mock"
     res.name = "res-1"
+    res.annotations = {ORIGINAL_REPLICAS_ANNOTATION: "1", DOWNTIME_REPLICAS_ANNOTATION: "0"}
+    return res
+
+@pytest.fixture
+def namespace():
+    res = MagicMock()
+    res.name="ns-1"
     res.annotations = {}
     return res
 
@@ -499,6 +508,89 @@ def test_downscale_always(resource):
     assert resource.replicas == 0
     resource.update.assert_called_once()
     assert resource.annotations[ORIGINAL_REPLICAS_ANNOTATION] == "1"
+
+
+def test_get_and_adjust_auto_downscale_snoozed_at_now(namespace):
+    now = datetime.fromisoformat('2023-07-26T14:34:57.083727')
+    namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] = now
+    out = get_and_adjust_auto_downscale_snoozed_at(namespace, now)
+    assert out == now
+    assert namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] == now.isoformat()
+
+
+def test_get_and_adjust_auto_downscale_snoozed_at_future(namespace):
+    now = datetime.fromisoformat('2023-07-26T14:34:57.083727')
+    namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] = now + timedelta(seconds=10)
+    out = get_and_adjust_auto_downscale_snoozed_at(namespace, now)
+    assert out == now
+    assert namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] == now.isoformat()
+
+
+def test_get_and_adjust_auto_downscale_snoozed_at_garbage(namespace):
+    now = datetime.fromisoformat('2023-07-26T14:34:57.083727')
+    namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] = "garbage"
+    out = get_and_adjust_auto_downscale_snoozed_at(namespace, now)
+    assert out == now
+    assert namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] == now.isoformat()
+
+
+def test_get_and_adjust_auto_downscale_snoozed_at_past(namespace):
+    now = datetime.fromisoformat('2023-07-26T14:34:57.083727')
+    snoozed_at = now - timedelta(seconds=10)
+    namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] = snoozed_at.isoformat()
+    out = get_and_adjust_auto_downscale_snoozed_at(namespace, now)
+    assert out == snoozed_at
+    assert namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] == snoozed_at.isoformat()
+
+
+def call_autoscale_namespace(now, snoozed_at, auto_downscale_period_sec, resource):
+    resource.replicas = 1
+    resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
+    api = MagicMock()
+    kind = MagicMock()
+    kind.objects = MagicMock(return_value=[resource])
+    namespace_obj = MagicMock()
+    namespace_obj.name = "mocked by me"
+    namespace_obj.update = MagicMock()
+    namespace_obj.annotations = {EXCLUDE_ANNOTATION: "false", AUTODOWNSCALE_SNOOZED_AT: datetime.isoformat(snoozed_at)}
+    objects_ret = MagicMock()
+    objects_ret.get_by_name = MagicMock(return_value=namespace_obj)
+    Namespace.objects = MagicMock(return_value=objects_ret)
+    autoscale_resources(api, kind, namespace_obj.name, set([]), set([]), set([]),
+                        auto_downscale=True,
+                        auto_downscale_period_seconds=auto_downscale_period_sec,
+                        upscale_period="never",
+                        downscale_period="Mon-Fri 20:30-24:00 Europe/Berlin",
+                        default_uptime="always",
+                        default_downtime="never",
+                        forced_uptime=False,
+                        grace_period=0,
+                        downtime_replicas=0,
+                        deployment_time_annotation="",
+                        dry_run=False,
+                        now=now
+                        )
+
+
+def test_autoscale_past_snooze(resource):
+    now = datetime.strptime("2023-07-26T08:09:00Z", "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+    auto_downscale_period_sec = 10
+    call_autoscale_namespace(now, now - timedelta(seconds=auto_downscale_period_sec + 1), auto_downscale_period_sec, resource)
+    assert resource.replicas == 0
+    resource.update.assert_called_once()
+    assert resource.annotations[ORIGINAL_REPLICAS_ANNOTATION] == "1"
+
+
+def test_autoscale_before_snooze(resource):
+    now = datetime.strptime("2023-07-26T08:09:00Z", "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+    auto_downscale_period_sec = 10
+    call_autoscale_namespace(now, now - timedelta(seconds=auto_downscale_period_sec - 1), auto_downscale_period_sec, resource)
+    assert resource.replicas == 1
+    resource.update.assert_not_called()
 
 
 def test_downscale_period(resource):
