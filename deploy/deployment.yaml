@@ -19,12 +19,17 @@ spec:
       serviceAccountName: kube-downscaler
       containers:
       - name: downscaler
-        image: hjacobs/kube-downscaler:23.2.0
+        image: apolyakov/kube-downscaler:23.2.0-1
+        imagePullPolicy: Always
         args:
           # dry run by default, remove to perform downscaling
-          - --dry-run
+          #- --dry-run
           # run every minute
-          - --interval=60
+          - --interval=10
+          - --debug
+          - --namespace=dr-app
+          - --matching-labels=.*
+          - --include-resources=deployments,statefulsets,cronjobs
         envFrom:
           - configMapRef:
               name: kube-downscaler
