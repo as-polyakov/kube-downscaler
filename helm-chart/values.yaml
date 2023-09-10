@@ -9,25 +9,41 @@ debug:
   enable: True
 
 ## Namespace where kube-downscaler is going to be deployed.
-# namespace:
+namespace:
   ## Deployment will query all namespaces if left empty:
 #  active_in:
   ## Deployment exclude these namespaces:
-#  inactive_in:
+  inactive_in:
+    - aws-load-balancer-controller
+    - cert-manager
+    - crowdstrike-falcon
+    - default
+    - external-dns
+    - external-secrets
+    - flux-system
+    - ingress-nginx
+    - karpenter
+    - kube-node-lease
+    - kube-public
+    - kube-system
+    - kyverno
+    - node-problem-detector
+    - nvidia-device-plugin
+    - observability
 ## How frequently kube-downscaler should query applications uptime, unit is in seconds.
 
 ## Default is 1 minute.
-interval: 60
+interval: 10
 rbac:
   ## If true, create & use RBAC resources
-  create: false
+  create: true
   ## Ignored if rbac.create is true
   serviceAccountName: default
 image:
-  repository: hjacobs/kube-downscaler
-  tag: 19.10.1
+  repository: apolyakov/kube-downscaler
+  tag: 23.2.0-1
   pullPolicy: IfNotPresent
-  args: []
+  args: [--matching-labels=.*, --auto-downscale, --auto-downscale-period-seconds=10800]
     # --default-uptime="Mon-Fri 07:30-20:30 Europe/Berlin"
 resources:
   limits:
@@ -36,10 +52,6 @@ resources:
   requests:
     cpu: 50m
     memory: 200Mi
-securityContext:
-  readOnlyRootFilesystem: true
-  runAsNonRoot: true
-  runAsUser: 1000
 
   ## Allow the DaemonSet to schedule on tainted nodes (requires Kubernetes >= 1.6)
   # tolerations: []
