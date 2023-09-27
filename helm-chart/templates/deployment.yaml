@@ -18,15 +18,18 @@ spec:
   template:
     metadata:
       labels:
+        app.kubernetes.io/name: {{ template "kube-downscaler.fullname" . }}
         app: {{ template "kube-downscaler.fullname" . }}
         release: {{ .Release.Name }}
     spec:
+      automountServiceAccountToken: true
       serviceAccountName: {{ if .Values.rbac.create }}{{ template "kube-downscaler.fullname" . }}{{ else }}"{{ .Values.rbac.serviceAccountName }}"{{ end }}
       containers:
       - name: {{ template "kube-downscaler.fullname" . }}
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
         args:
         - --interval={{ .Values.interval }}
+        - --include-resources=deployments,statefulsets,cronjobs
         {{- if .Values.namespace }}
         {{- if .Values.namespace.active_in }}
         - --namespace={{ .Values.namespace.active_in }}
@@ -44,3 +47,12 @@ spec:
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         resources:
 {{ toYaml .Values.resources | indent 10 }}
+        securityContext:
+          capabilities:
+            drop: ["ALL"]
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          seccompProfile:
+            type: RuntimeDefault

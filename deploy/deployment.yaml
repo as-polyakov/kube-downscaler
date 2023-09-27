@@ -1,9 +1,10 @@
+# TODO: Add health check in source code
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   labels:
     application: kube-downscaler
-    version: v20.10.0
+    version: v23.2.0
   name: kube-downscaler
 spec:
   replicas: 1
@@ -14,18 +15,22 @@ spec:
     metadata:
       labels:
         application: kube-downscaler
-        version: v20.10.0
+        version: v23.2.0
     spec:
       serviceAccountName: kube-downscaler
       containers:
       - name: downscaler
-        # see https://github.com/hjacobs/kube-downscaler/releases
-        image: hjacobs/kube-downscaler:20.10.0
+        image: apolyakov/kube-downscaler:23.2.0-1
+        imagePullPolicy: Always
         args:
           # dry run by default, remove to perform downscaling
-          - --dry-run
+          #- --dry-run
           # run every minute
-          - --interval=60
+          - --interval=10
+          - --debug
+          - --namespace=dr-app
+          - --matching-labels=.*
+          - --include-resources=deployments,statefulsets,cronjobs
         envFrom:
           - configMapRef:
               name: kube-downscaler

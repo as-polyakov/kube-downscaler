@@ -6,7 +6,7 @@ description = "Scale down Kubernetes deployments after work hours"
 authors = ["Henning Jacobs <henning@jacobs1.de>"]
 
 [tool.poetry.dependencies]
-python = ">=3.7"
+python = ">=3.8,<4"
 pykube-ng = "*"
 pytz = "*"
 
@@ -16,6 +16,6 @@ coveralls = "*"
 flake8 = "*"
 pytest = "*"
 pytest-cov = "*"
-black = "^19.10b0"
-mypy = "^0.761"
-pre-commit = "^1.21.0"
+black = "^22.3.0"
+mypy = "*"
+pre-commit = "^2.9.2"

@@ -24,10 +24,11 @@ version:
 	sed -i "s/kube-downscaler:.*/kube-downscaler:$(VERSION)/" deploy/*.yaml
 
 docker:
-	docker build --build-arg "VERSION=$(VERSION)" -t "$(IMAGE):$(TAG)" .
-	@echo 'Docker image $(IMAGE):$(TAG) can now be used.'
+	docker buildx create --use
+	docker buildx build --rm --build-arg "VERSION=$(VERSION)" -t "$(IMAGE):$(TAG)" -t "$(IMAGE):latest" --platform linux/amd64,linux/arm64 .
+	@echo 'Docker image $(IMAGE):$(TAG) multi-arch was build (cannot be used).'
 
-push: docker
-	docker push "$(IMAGE):$(TAG)"
-	docker tag "$(IMAGE):$(TAG)" "$(IMAGE):latest"
-	docker push "$(IMAGE):latest"
+push:
+	docker buildx create --use
+	docker buildx build --rm --build-arg "VERSION=$(VERSION)" -t "$(IMAGE):$(TAG)" -t "$(IMAGE):latest" --platform linux/amd64,linux/arm64 --push .
+	@echo 'Docker image $(IMAGE):$(TAG) multi-arch can now be used.'

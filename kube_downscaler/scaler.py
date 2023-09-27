@@ -15,10 +15,13 @@ from pykube.objects import NamespacedAPIObject
 
 from kube_downscaler import helper
 from kube_downscaler.helper import matches_time_spec
+from kube_downscaler.resources.keda import ScaledObject
+from kube_downscaler.resources.rollout import ArgoRollout
 from kube_downscaler.resources.stack import Stack
 
 ORIGINAL_REPLICAS_ANNOTATION = "downscaler/original-replicas"
 FORCE_UPTIME_ANNOTATION = "downscaler/force-uptime"
+FORCE_DOWNTIME_ANNOTATION = "downscaler/force-downtime"
 UPSCALE_PERIOD_ANNOTATION = "downscaler/upscale-period"
 DOWNSCALE_PERIOD_ANNOTATION = "downscaler/downscale-period"
 EXCLUDE_ANNOTATION = "downscaler/exclude"
@@ -26,8 +29,17 @@ EXCLUDE_UNTIL_ANNOTATION = "downscaler/exclude-until"
 UPTIME_ANNOTATION = "downscaler/uptime"
 DOWNTIME_ANNOTATION = "downscaler/downtime"
 DOWNTIME_REPLICAS_ANNOTATION = "downscaler/downtime-replicas"
+AUTODOWNSCALE_SNOOZED_AT = "downscaler/auto-downscale-snoozed-at"
 
-RESOURCE_CLASSES = [Deployment, StatefulSet, Stack, CronJob, HorizontalPodAutoscaler]
+RESOURCE_CLASSES = [
+    Deployment,
+    StatefulSet,
+    Stack,
+    CronJob,
+    HorizontalPodAutoscaler,
+    ArgoRollout,
+    ScaledObject,
+]
 
 TIMESTAMP_FORMATS = [
     "%Y-%m-%dT%H:%M:%SZ",
@@ -94,6 +106,28 @@ def is_stack_deployment(resource: NamespacedAPIObject) -> bool:
             ):
                 return True
     return False
+
+
+def ignore_if_labels_dont_match(
+    resource: NamespacedAPIObject, labels: FrozenSet[Pattern]
+) -> bool:
+    # For backwards compatibility, if there is no label filter, we don't ignore anything
+    if not labels:
+        return False
+
+    # Ignore resources whose labels do not match the set of input labels
+    resource_labels = [f"{key}={value}" for key, value in resource.labels.items()]
+    ignore = True
+    for label_pattern in labels:
+        if not ignore:
+            break
+        ignore = not any(
+            [
+                label_pattern.fullmatch(resource_label)
+                for resource_label in resource_labels
+            ]
+        )
+    return ignore
 
 
 def ignore_resource(resource: NamespacedAPIObject, now: datetime.datetime) -> bool:
@@ -166,6 +200,16 @@ def scale_up(
         logger.info(
             f"Scaling up {resource.kind} {resource.namespace}/{resource.name} from {replicas} to {original_replicas} minReplicas (uptime: {uptime}, downtime: {downtime})"
         )
+    elif resource.kind == "Rollout":
+        resource.obj["spec"]["replicas"] = original_replicas
+        logger.info(
+            f"Scaling up {resource.kind} {resource.namespace}/{resource.name} from {replicas} to {original_replicas} replicas (uptime: {uptime}, downtime: {downtime})"
+        )
+    elif resource.kind == "ScaledObject":
+        resource.annotations[ScaledObject.keda_pause_annotation] = None
+        logger.info(
+            f"Unpausing {resource.kind} {resource.namespace}/{resource.name} (uptime: {uptime}, downtime: {downtime}"
+        )
     else:
         resource.replicas = original_replicas
         logger.info(
@@ -173,7 +217,11 @@ def scale_up(
         )
     if enable_events:
         helper.add_event(
-            resource, event_message, "ScaleUp", "Normal", dry_run,
+            resource,
+            event_message,
+            "ScaleUp",
+            "Normal",
+            dry_run,
         )
     resource.annotations[ORIGINAL_REPLICAS_ANNOTATION] = None
 
@@ -199,6 +247,17 @@ def scale_down(
         logger.info(
             f"Scaling down {resource.kind} {resource.namespace}/{resource.name} from {replicas} to {target_replicas} minReplicas (uptime: {uptime}, downtime: {downtime})"
         )
+    elif resource.kind == "Rollout":
+        resource.obj["spec"]["replicas"] = target_replicas
+        logger.info(
+            f"Scaling down {resource.kind} {resource.namespace}/{resource.name} from {replicas} to {target_replicas} replicas (uptime: {uptime}, downtime: {downtime})"
+        )
+    elif resource.kind == "ScaledObject":
+        resource.annotations[ScaledObject.keda_pause_annotation] = "0"
+        logger.info(
+            f"Pausing {resource.kind} {resource.namespace}/{resource.name} (uptime: {uptime}, downtime: {downtime}"
+        )
+        event_message = "Pausing KEDA ScaledObject"
     else:
         resource.replicas = target_replicas
         logger.info(
@@ -206,7 +265,11 @@ def scale_down(
         )
     if enable_events:
         helper.add_event(
-            resource, event_message, "ScaleDown", "Normal", dry_run,
+            resource,
+            event_message,
+            "ScaleDown",
+            "Normal",
+            dry_run,
         )
     resource.annotations[ORIGINAL_REPLICAS_ANNOTATION] = str(replicas)
 
@@ -232,6 +295,7 @@ def autoscale_resource(
     default_uptime: str,
     default_downtime: str,
     forced_uptime: bool,
+    forced_downtime: bool,
     dry_run: bool,
     now: datetime.datetime,
     grace_period: int = 0,
@@ -239,9 +303,17 @@ def autoscale_resource(
     namespace_excluded=False,
     deployment_time_annotation: Optional[str] = None,
     enable_events: bool = False,
+    matching_labels: FrozenSet[Pattern] = frozenset(),
+    auto_downscale: bool = False,
+    auto_downscale_snoozed_at: datetime.datetime = None,
+    auto_downscale_period_seconds: int = 0,
 ):
     try:
-        exclude = namespace_excluded or ignore_resource(resource, now)
+        exclude = (
+            namespace_excluded
+            or ignore_if_labels_dont_match(resource, matching_labels)
+            or ignore_resource(resource, now)
+        )
         original_replicas = get_annotation_value_as_int(
             resource, ORIGINAL_REPLICAS_ANNOTATION
         )
@@ -269,6 +341,21 @@ def autoscale_resource(
                 uptime = "forced"
                 downtime = "ignored"
                 is_uptime = True
+            elif forced_downtime and not (exclude and original_replicas):
+                uptime = "ignored"
+                downtime = "forced"
+                is_uptime = False
+            elif auto_downscale:
+                uptime = "ignored"
+                downtime = "ignored"
+                logger.debug(
+                    f"Auto downscaling is enabled {resource.namespace} has snoozed at set to {auto_downscale_snoozed_at}"
+                )
+                if auto_downscale_snoozed_at is None or auto_downscale_snoozed_at + datetime.timedelta(seconds=auto_downscale_period_seconds) < now:
+                    is_uptime = False
+                    logger.debug(
+                        f"setting uptime to false as auto downscale is enabled and snooze period has passed"
+                    )
             elif upscale_period != "never" or downscale_period != "never":
                 uptime = upscale_period
                 downtime = downscale_period
@@ -357,6 +444,9 @@ def autoscale_resources(
     namespace: str,
     exclude_namespaces: FrozenSet[Pattern],
     exclude_names: FrozenSet[str],
+    matching_labels: FrozenSet[Pattern],
+    auto_downscale: bool,
+    auto_downscale_period_seconds: int,
     upscale_period: str,
     downscale_period: str,
     default_uptime: str,
@@ -397,6 +487,8 @@ def autoscale_resources(
 
         excluded = ignore_resource(namespace_obj, now)
 
+        auto_downscale_snoozed_at = get_and_adjust_auto_downscale_snoozed_at(namespace_obj, now)
+
         default_uptime_for_namespace = namespace_obj.annotations.get(
             UPTIME_ANNOTATION, default_uptime
         )
@@ -418,6 +510,9 @@ def autoscale_resources(
         forced_uptime_value_for_namespace = str(
             namespace_obj.annotations.get(FORCE_UPTIME_ANNOTATION, forced_uptime)
         )
+        forced_downtime_value_for_namespace = str(
+            namespace_obj.annotations.get(FORCE_DOWNTIME_ANNOTATION, False)
+        )
         if forced_uptime_value_for_namespace.lower() == "true":
             forced_uptime_for_namespace = True
         elif forced_uptime_value_for_namespace.lower() == "false":
@@ -429,6 +524,17 @@ def autoscale_resources(
         else:
             forced_uptime_for_namespace = False
 
+        if forced_downtime_value_for_namespace.lower() == "true":
+            forced_downtime_for_namespace = True
+        elif forced_downtime_value_for_namespace.lower() == "false":
+            forced_downtime_for_namespace = False
+        elif forced_downtime_value_for_namespace:
+            forced_downtime_for_namespace = matches_time_spec(
+                now, forced_downtime_value_for_namespace
+            )
+        else:
+            forced_downtime_for_namespace = False
+
         for resource in resources:
             autoscale_resource(
                 resource,
@@ -437,6 +543,7 @@ def autoscale_resources(
                 default_uptime_for_namespace,
                 default_downtime_for_namespace,
                 forced_uptime_for_namespace,
+                forced_downtime_for_namespace,
                 dry_run,
                 now,
                 grace_period,
@@ -444,7 +551,34 @@ def autoscale_resources(
                 namespace_excluded=excluded,
                 deployment_time_annotation=deployment_time_annotation,
                 enable_events=enable_events,
+                matching_labels=matching_labels,
+                auto_downscale=auto_downscale,
+                auto_downscale_snoozed_at=auto_downscale_snoozed_at,
+                auto_downscale_period_seconds=auto_downscale_period_seconds,
             )
+
+
+def get_and_adjust_auto_downscale_snoozed_at(namespace_obj, now: datetime):
+    auto_downscale_snoozed_at_str = namespace_obj.annotations.get(
+        AUTODOWNSCALE_SNOOZED_AT, None
+    )
+    if auto_downscale_snoozed_at_str is None:
+        return None
+    try:
+        auto_downscale_snoozed_at = datetime.datetime.fromisoformat(auto_downscale_snoozed_at_str)
+        if auto_downscale_snoozed_at > now:
+            logger.debug(f"AUTODOWNSCALE_SNOOZED_AT for {namespace_obj} is set to {auto_downscale_snoozed_at_str} which is in the future, resetting to now")
+            namespace_obj.annotations[AUTODOWNSCALE_SNOOZED_AT] = now.isoformat()
+            namespace_obj.update()
+            auto_downscale_snoozed_at = now
+    except (TypeError, ValueError) as e:
+        logger.debug(
+            f"Can't convert AUTODOWNSCALE_SNOOZED_AT from {auto_downscale_snoozed_at_str} to date, gonna use "
+            f"current date and reset AUTODOWNSCALE_SNOOZED_AT to current date {now} ")
+        namespace_obj.annotations[AUTODOWNSCALE_SNOOZED_AT] = now.isoformat()
+        namespace_obj.update()
+        auto_downscale_snoozed_at = now
+    return auto_downscale_snoozed_at
 
 
 def scale(
@@ -461,10 +595,13 @@ def scale(
     downtime_replicas: int = 0,
     deployment_time_annotation: Optional[str] = None,
     enable_events: bool = False,
+    matching_labels: FrozenSet[Pattern] = frozenset(),
+    auto_downscale: bool = False,
+    auto_downscale_period_seconds: int = 0,
 ):
     api = helper.get_kube_api()
 
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=datetime.timezone.utc)
     forced_uptime = pods_force_uptime(api, namespace)
 
     for clazz in RESOURCE_CLASSES:
@@ -476,6 +613,9 @@ def scale(
                 namespace,
                 exclude_namespaces,
                 exclude_deployments,
+                matching_labels,
+                auto_downscale,
+                auto_downscale_period_seconds,
                 upscale_period,
                 downscale_period,
                 default_uptime,

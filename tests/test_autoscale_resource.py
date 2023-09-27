@@ -1,16 +1,18 @@
 import json
 import logging
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from unittest.mock import MagicMock
 
 import pykube
 import pytest
-from pykube import Deployment
+from pykube import Deployment, Namespace
 from pykube import HorizontalPodAutoscaler
 
 from kube_downscaler.resources.stack import Stack
-from kube_downscaler.scaler import autoscale_resource
+from kube_downscaler.scaler import autoscale_resource, AUTODOWNSCALE_SNOOZED_AT, autoscale_resources
+from kube_downscaler.scaler import get_and_adjust_auto_downscale_snoozed_at
 from kube_downscaler.scaler import DOWNSCALE_PERIOD_ANNOTATION
 from kube_downscaler.scaler import DOWNTIME_REPLICAS_ANNOTATION
 from kube_downscaler.scaler import EXCLUDE_ANNOTATION
@@ -25,6 +27,13 @@ def resource():
     res.kind = "MockResource"
     res.namespace = "mock"
     res.name = "res-1"
+    res.annotations = {ORIGINAL_REPLICAS_ANNOTATION: "1", DOWNTIME_REPLICAS_ANNOTATION: "0"}
+    return res
+
+@pytest.fixture
+def namespace():
+    res = MagicMock()
+    res.name="ns-1"
     res.annotations = {}
     return res
 
@@ -38,7 +47,15 @@ def test_swallow_exception(monkeypatch, resource, caplog):
     )
     resource.metadata = {"creationTimestamp": "invalid-timestamp!"}
     autoscale_resource(
-        resource, "never", "never", "never", "always", False, False, now, 0, 0
+        resource,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="never",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=True,
+        now=now,
     )
     assert resource.replicas == 1
     resource.update.assert_not_called()
@@ -60,15 +77,14 @@ def test_swallow_exception_with_event(monkeypatch, resource, caplog):
     resource.metadata = {"creationTimestamp": "invalid-timestamp!"}
     autoscale_resource(
         resource,
-        "never",
-        "never",
-        "never",
-        "always",
-        False,
-        False,
-        now,
-        0,
-        0,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="never",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=True,
+        now=now,
         enable_events=True,
     )
     assert resource.replicas == 1
@@ -86,7 +102,15 @@ def test_exclude(resource):
     )
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
-        resource, "never", "never", "never", "always", False, False, now, 0, 0
+        resource,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="never",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=True,
+        now=now,
     )
     assert resource.replicas == 1
     resource.update.assert_not_called()
@@ -103,11 +127,12 @@ def test_exclude_until_invalid_time(resource, caplog):
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
         resource,
-        "never",
-        "never",
-        "never",
-        "always",
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="never",
+        default_downtime="never",
         forced_uptime=False,
+        forced_downtime=False,
         dry_run=True,
         now=now,
     )
@@ -130,13 +155,13 @@ def test_dry_run(resource):
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
         resource,
-        "never",
-        "never",
-        "never",
-        "always",
-        False,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="never",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=False,
         dry_run=True,
-        enable_events=False,
         now=now,
         grace_period=0,
         downtime_replicas=0,
@@ -157,16 +182,15 @@ def test_grace_period(resource):
     # resource was only created 1 minute ago, grace period is 5 minutes
     autoscale_resource(
         resource,
-        "never",
-        "never",
-        "never",
-        "always",
-        False,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="never",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=False,
         dry_run=False,
-        enable_events=False,
         now=now,
         grace_period=300,
-        downtime_replicas=0,
     )
     assert resource.replicas == 1
     assert resource.annotations == {}
@@ -181,7 +205,15 @@ def test_downtime_always(resource):
     )
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
-        resource, "never", "never", "never", "always", False, False, now, 0, 0
+        resource,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="never",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     assert resource.replicas == 0
     resource.update.assert_called_once()
@@ -197,15 +229,14 @@ def test_downtime_interval(resource):
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
         resource,
-        "never",
-        "never",
-        "Mon-Fri 07:30-20:30 Europe/Berlin",
-        "always",
-        False,
-        False,
-        now,
-        0,
-        0,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="Mon-Fri 07:30-20:30 Europe/Berlin",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     assert resource.replicas == 0
     resource.update.assert_called_once()
@@ -221,18 +252,39 @@ def test_forced_uptime(resource):
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
         resource,
-        "never",
-        "never",
-        "Mon-Fri 07:30-20:30 Europe/Berlin",
-        "always",
-        True,
-        False,
-        now,
-        0,
-        0,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="Mon-Fri 07:30-20:30 Europe/Berlin",
+        default_downtime="always",
+        forced_uptime=True,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     assert resource.replicas == 1
     resource.update.assert_not_called()
+
+
+def test_forced_downtime(resource):
+    resource.annotations = {EXCLUDE_ANNOTATION: "false"}
+    resource.replicas = 1
+    now = datetime.strptime("2018-10-23T15:00:00Z", "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+    resource.metadata = {"creationTimestamp": "2018-10-23T14:59:00Z"}
+    autoscale_resource(
+        resource,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="Mon-Fri 07:30-20:30 Europe/Berlin",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=True,
+        dry_run=False,
+        now=now,
+    )
+    assert resource.replicas == 0
+    resource.update.assert_called_once()
 
 
 def test_autoscale_bad_resource():
@@ -241,7 +293,15 @@ def test_autoscale_bad_resource():
     )
     try:
         autoscale_resource(
-            None, "never", "never", "never", "always", False, False, now, 0, 0
+            resource=None,
+            upscale_period="never",
+            downscale_period="never",
+            default_uptime="never",
+            default_downtime="always",
+            forced_uptime=False,
+            forced_downtime=False,
+            dry_run=False,
+            now=now,
         )
         raise AssertionError("Failed to error out with a bad resource")
     except Exception:
@@ -260,15 +320,14 @@ def test_scale_up(resource):
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
         resource,
-        "never",
-        "never",
-        "Mon-Fri 07:30-20:30 Europe/Berlin",
-        "never",
-        False,
-        False,
-        now,
-        0,
-        0,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="Mon-Fri 07:30-20:30 Europe/Berlin",
+        default_downtime="never",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     assert resource.replicas == 3
     resource.update.assert_called_once()
@@ -287,15 +346,15 @@ def test_scale_up_downtime_replicas_annotation(resource):
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
         resource,
-        "never",
-        "never",
-        "Mon-Fri 07:30-20:30 Europe/Berlin",
-        "never",
-        False,
-        False,
-        now,
-        0,
-        1,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="Mon-Fri 07:30-20:30 Europe/Berlin",
+        default_downtime="never",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
+        downtime_replicas=1,
     )
     assert resource.replicas == 1
     resource.update.assert_called_once()
@@ -309,7 +368,15 @@ def test_downtime_replicas_annotation_invalid(resource):
     )
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
-        resource, "never", "never", "never", "always", False, False, now, 0, 0
+        resource,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="never",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     assert resource.replicas == 2
     resource.update.assert_not_called()
@@ -323,7 +390,15 @@ def test_downtime_replicas_annotation_valid(resource):
     )
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
-        resource, "never", "never", "never", "always", False, False, now, 0, 0
+        resource,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="never",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     assert resource.replicas == 1
     resource.update.assert_called_once()
@@ -337,7 +412,16 @@ def test_downtime_replicas_invalid(resource):
     )
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
-        resource, "never", "never", "never", "always", False, False, now, 0, "x"
+        resource,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="never",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
+        downtime_replicas="x",
     )
     assert resource.replicas == 2
     resource.update.assert_not_called()
@@ -350,7 +434,16 @@ def test_downtime_replicas_valid(resource):
     )
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
-        resource, "never", "never", "never", "always", False, False, now, 0, 1
+        resource,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="never",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
+        downtime_replicas=1,
     )
     assert resource.replicas == 1
     resource.update.assert_called_once()
@@ -371,7 +464,15 @@ def test_set_annotation():
         tzinfo=timezone.utc
     )
     autoscale_resource(
-        resource, "never", "never", "never", "always", False, False, now, 0, 0
+        resource,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="never",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     api.patch.assert_called_once()
     patch_data = json.loads(api.patch.call_args[1]["data"])
@@ -394,11 +495,102 @@ def test_downscale_always(resource):
     )
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
-        resource, "never", "always", "always", "never", False, False, now, 0, 0
+        resource,
+        upscale_period="never",
+        downscale_period="always",
+        default_uptime="always",
+        default_downtime="never",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     assert resource.replicas == 0
     resource.update.assert_called_once()
     assert resource.annotations[ORIGINAL_REPLICAS_ANNOTATION] == "1"
+
+
+def test_get_and_adjust_auto_downscale_snoozed_at_now(namespace):
+    now = datetime.fromisoformat('2023-07-26T14:34:57.083727')
+    namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] = now
+    out = get_and_adjust_auto_downscale_snoozed_at(namespace, now)
+    assert out == now
+    assert namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] == now.isoformat()
+
+
+def test_get_and_adjust_auto_downscale_snoozed_at_future(namespace):
+    now = datetime.fromisoformat('2023-07-26T14:34:57.083727')
+    namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] = now + timedelta(seconds=10)
+    out = get_and_adjust_auto_downscale_snoozed_at(namespace, now)
+    assert out == now
+    assert namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] == now.isoformat()
+
+
+def test_get_and_adjust_auto_downscale_snoozed_at_garbage(namespace):
+    now = datetime.fromisoformat('2023-07-26T14:34:57.083727')
+    namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] = "garbage"
+    out = get_and_adjust_auto_downscale_snoozed_at(namespace, now)
+    assert out == now
+    assert namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] == now.isoformat()
+
+
+def test_get_and_adjust_auto_downscale_snoozed_at_past(namespace):
+    now = datetime.fromisoformat('2023-07-26T14:34:57.083727')
+    snoozed_at = now - timedelta(seconds=10)
+    namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] = snoozed_at.isoformat()
+    out = get_and_adjust_auto_downscale_snoozed_at(namespace, now)
+    assert out == snoozed_at
+    assert namespace.annotations[AUTODOWNSCALE_SNOOZED_AT] == snoozed_at.isoformat()
+
+
+def call_autoscale_namespace(now, snoozed_at, auto_downscale_period_sec, resource):
+    resource.replicas = 1
+    resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
+    api = MagicMock()
+    kind = MagicMock()
+    kind.objects = MagicMock(return_value=[resource])
+    namespace_obj = MagicMock()
+    namespace_obj.name = "mocked by me"
+    namespace_obj.update = MagicMock()
+    namespace_obj.annotations = {EXCLUDE_ANNOTATION: "false", AUTODOWNSCALE_SNOOZED_AT: datetime.isoformat(snoozed_at)}
+    objects_ret = MagicMock()
+    objects_ret.get_by_name = MagicMock(return_value=namespace_obj)
+    Namespace.objects = MagicMock(return_value=objects_ret)
+    autoscale_resources(api, kind, namespace_obj.name, set([]), set([]), set([]),
+                        auto_downscale=True,
+                        auto_downscale_period_seconds=auto_downscale_period_sec,
+                        upscale_period="never",
+                        downscale_period="Mon-Fri 20:30-24:00 Europe/Berlin",
+                        default_uptime="always",
+                        default_downtime="never",
+                        forced_uptime=False,
+                        grace_period=0,
+                        downtime_replicas=0,
+                        deployment_time_annotation="",
+                        dry_run=False,
+                        now=now
+                        )
+
+
+def test_autoscale_past_snooze(resource):
+    now = datetime.strptime("2023-07-26T08:09:00Z", "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+    auto_downscale_period_sec = 10
+    call_autoscale_namespace(now, now - timedelta(seconds=auto_downscale_period_sec + 1), auto_downscale_period_sec, resource)
+    assert resource.replicas == 0
+    resource.update.assert_called_once()
+    assert resource.annotations[ORIGINAL_REPLICAS_ANNOTATION] == "1"
+
+
+def test_autoscale_before_snooze(resource):
+    now = datetime.strptime("2023-07-26T08:09:00Z", "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=timezone.utc
+    )
+    auto_downscale_period_sec = 10
+    call_autoscale_namespace(now, now - timedelta(seconds=auto_downscale_period_sec - 1), auto_downscale_period_sec, resource)
+    assert resource.replicas == 1
+    resource.update.assert_not_called()
 
 
 def test_downscale_period(resource):
@@ -410,15 +602,14 @@ def test_downscale_period(resource):
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
         resource,
-        "never",
-        "Mon-Fri 20:30-24:00 Europe/Berlin",
-        "always",
-        "never",
-        False,
-        False,
-        now,
-        0,
-        0,
+        upscale_period="never",
+        downscale_period="Mon-Fri 20:30-24:00 Europe/Berlin",
+        default_uptime="always",
+        default_downtime="never",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     assert resource.replicas == 0
     resource.update.assert_called_once()
@@ -434,15 +625,14 @@ def test_downscale_period_overlaps(resource):
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
         resource,
-        "Mon-Fri 20:30-24:00 Europe/Berlin",
-        "Mon-Fri 20:30-24:00 Europe/Berlin",
-        "always",
-        "never",
-        False,
-        False,
-        now,
-        0,
-        0,
+        upscale_period="Mon-Fri 20:30-24:00 Europe/Berlin",
+        downscale_period="Mon-Fri 20:30-24:00 Europe/Berlin",
+        default_uptime="always",
+        default_downtime="never",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     assert resource.replicas == 2
     resource.update.assert_not_called()
@@ -457,15 +647,14 @@ def test_downscale_period_not_match(resource):
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
         resource,
-        "never",
-        "Mon-Fri 07:30-10:00 Europe/Berlin",
-        "always",
-        "never",
-        False,
-        False,
-        now,
-        0,
-        0,
+        upscale_period="never",
+        downscale_period="Mon-Fri 07:30-10:00 Europe/Berlin",
+        default_uptime="always",
+        default_downtime="never",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     assert resource.replicas == 2
     resource.update.assert_not_called()
@@ -481,7 +670,15 @@ def test_downscale_period_resource_overrides_never(resource):
     )
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
-        resource, "never", "never", "always", "never", False, False, now, 0, 0
+        resource,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="always",
+        default_downtime="never",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     assert resource.replicas == 0
     resource.update.assert_called_once()
@@ -498,15 +695,14 @@ def test_downscale_period_resource_overrides_namespace(resource):
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
         resource,
-        "never",
-        "Mon-Fri 22:00-24:00 Europe/Berlin",
-        "always",
-        "never",
-        False,
-        False,
-        now,
-        0,
-        0,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="always",
+        default_downtime="never",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     assert resource.replicas == 0
     resource.update.assert_called_once()
@@ -523,7 +719,15 @@ def test_upscale_period_resource_overrides_never(resource):
     )
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
-        resource, "never", "never", "always", "never", False, False, now, 0, 0
+        resource,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="always",
+        default_downtime="never",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     assert resource.replicas == 1
     resource.upd
@@ -541,15 +745,14 @@ def test_upscale_period_resource_overrides_namespace(resource):
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
         resource,
-        "Mon-Fri 22:00-24:00 Europe/Berlin",
-        "never",
-        "always",
-        "never",
-        False,
-        False,
-        now,
-        0,
-        0,
+        upscale_period="Mon-Fri 22:00-24:00 Europe/Berlin",
+        downscale_period="never",
+        default_uptime="always",
+        default_downtime="never",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     assert resource.replicas == 1
     resource.upd
@@ -572,7 +775,15 @@ def test_downscale_stack_deployment_ignored():
         tzinfo=timezone.utc
     )
     autoscale_resource(
-        resource, "never", "never", "never", "always", False, False, now, 0, 0
+        resource,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="never",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
     )
     assert resource.replicas == 1
     resource.update.assert_not_called()
@@ -587,12 +798,30 @@ def test_downscale_replicas_not_zero(resource):
     )
     resource.metadata = {"creationTimestamp": "2018-10-23T21:55:00Z"}
     autoscale_resource(
-        resource, "never", "never", "never", "always", False, False, now, 0, 1
+        resource,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="never",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
+        downtime_replicas=1,
     )
     assert resource.replicas == 1
     assert resource.annotations[ORIGINAL_REPLICAS_ANNOTATION] == "3"
     autoscale_resource(
-        resource, "never", "never", "never", "always", False, False, now, 0, 1
+        resource,
+        upscale_period="never",
+        downscale_period="never",
+        default_uptime="never",
+        default_downtime="always",
+        forced_uptime=False,
+        forced_downtime=False,
+        dry_run=False,
+        now=now,
+        downtime_replicas=1,
     )
     assert resource.replicas == 1
     assert resource.annotations[ORIGINAL_REPLICAS_ANNOTATION] == "3"
@@ -623,6 +852,7 @@ def test_downscale_stack_with_autoscaling():
         default_uptime="never",
         default_downtime="always",
         forced_uptime=False,
+        forced_downtime=False,
         dry_run=True,
         now=now,
     )
@@ -654,6 +884,7 @@ def test_upscale_stack_with_autoscaling():
         default_uptime="always",
         default_downtime="never",
         forced_uptime=False,
+        forced_downtime=False,
         dry_run=True,
         enable_events=False,
         now=now,
@@ -686,6 +917,7 @@ def test_downscale_hpa_with_autoscaling():
         default_uptime="never",
         default_downtime="always",
         forced_uptime=False,
+        forced_downtime=False,
         dry_run=True,
         now=now,
     )
@@ -719,6 +951,7 @@ def test_upscale_hpa_with_autoscaling():
         default_uptime="always",
         default_downtime="never",
         forced_uptime=False,
+        forced_downtime=False,
         dry_run=True,
         now=now,
     )
