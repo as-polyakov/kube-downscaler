@@ -14,22 +14,15 @@ namespace:
 #  active_in:
   ## Deployment exclude these namespaces:
   inactive_in:
-    - aws-load-balancer-controller
+    - openshift.*
     - cert-manager
-    - crowdstrike-falcon
-    - default
-    - external-dns
-    - external-secrets
-    - flux-system
+    - dr-app-charts
+    - harness-delegate
     - ingress-nginx
-    - karpenter
-    - kube-node-lease
-    - kube-public
-    - kube-system
+    - kube.*
     - kyverno
-    - node-problem-detector
-    - nvidia-device-plugin
-    - observability
+    - namespace-terminator
+    - nvidia-gpu-operator
 ## How frequently kube-downscaler should query applications uptime, unit is in seconds.
 
 ## Default is 1 minute.

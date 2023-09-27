@@ -3,7 +3,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: {{ template "kube-downscaler.fullname" . }}
-automountServiceAccountToken: false
+automountServiceAccountToken: true
 ---
 apiVersion: {{ template "rbac.apiVersion" . }}
 kind: ClusterRole
